@@ -16,6 +16,13 @@
 use super::cl100k_family::batch_masks;
 #[cfg(target_arch = "x86_64")]
 use super::cl100k_family::batch_masks_x86;
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_feature = "altivec",
+    target_feature = "vsx",
+))]
+use super::cl100k_family::batch_masks_vsx;
 use super::mask::{MaskScheme, MaskState};
 use super::{
     decode_cp, is_ascii_ws, is_digit, is_letter, letter_end_at, scan_letters_from,
@@ -39,6 +46,22 @@ impl MaskScheme for Qwen2Scheme {
         // path's per-char classify is then a bare slice index.
         let ct = unicode::ClassTable::get();
         batch_masks(bytes, scan, false, move |cp| ct.class_of(cp))
+    }
+
+    // Overrides the trait's default-bad body; on a hypothetical LE build
+    // without VSX the default keeps every batch on the scalar path.
+    #[cfg(all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_feature = "altivec",
+        target_feature = "vsx",
+    ))]
+    #[inline(always)]
+    fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
+        // Class-table LazyLock resolved once per batch; the extended
+        // path's per-char classify is then a bare slice index.
+        let ct = unicode::ClassTable::get();
+        batch_masks_vsx(bytes, scan, false, move |cp| ct.class_of(cp))
     }
 
     #[cfg(target_arch = "x86_64")]
