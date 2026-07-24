@@ -22,6 +22,19 @@ impl MaskScheme for O200kScheme {
         o200k_family::batch_masks::<true, true, true, false>(bytes, scan)
     }
 
+    // Overrides the trait's default-bad body; on a hypothetical LE build
+    // without VSX the default keeps every batch on the scalar path.
+    #[cfg(all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_feature = "altivec",
+        target_feature = "vsx",
+    ))]
+    #[inline(always)]
+    fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
+        o200k_family::batch_masks_vsx::<true, true, true, false>(bytes, scan)
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn batch_masks_x86<const AVX512: bool>(bytes: &[u8], scan: usize) -> (u64, u64) {

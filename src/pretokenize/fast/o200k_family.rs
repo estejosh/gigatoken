@@ -48,7 +48,7 @@
 //! The boundary algebra below mirrors `cl100k_family` — see that module
 //! and pretokenizer_optimization_log.md step 16 for the base rules.
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 use super::mask::{self, AsciiMasks};
 use super::{decode_cp, is_ascii_ws, is_digit, is_letter, scan_numbers_max3};
 use crate::pretokenize::unicode::{O200kCharClass, kimi_class_of, o200k_class_of};
@@ -456,7 +456,7 @@ pub(crate) fn advance_pos<
 
 /// Smear `seed` upward (toward higher bits) through contiguous set bits of
 /// `within`, in log steps.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 fn smear_up(seed: u64, within: u64) -> u64 {
     let mut a = seed;
@@ -474,7 +474,7 @@ fn smear_up(seed: u64, within: u64) -> u64 {
 /// classifier — the o200k analogue of [`mask::UniClasses`], with the
 /// case-split letter masks the scheme needs. Every byte of a classified
 /// char carries the char's class, so byte-adjacency == char-adjacency.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[derive(Clone, Copy, Default)]
 struct OUni {
     /// All letter-run bytes (upper + lower + caseless; marks excluded —
@@ -522,7 +522,7 @@ struct OUni {
 
 /// Boundary carries from the chars before the batch (o200k variant of the
 /// cl100k family's `Carries`, plus the case and absorbed-tail bits).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[derive(Clone, Copy, Default)]
 struct OCarries {
     /// P1 is a letter / strict-upper / caseless / space (0x20) /
@@ -555,7 +555,7 @@ struct OCarries {
 /// (bounded) and classifies the byte before it. `None`: unresolved
 /// (over-long run, or a preceding mark or Han symbol whose own class is
 /// run-contextual).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 fn prev_tail_absorbed<const SLASH: bool, const HAN: bool>(
     bytes: &[u8],
     scan: usize,
@@ -633,7 +633,7 @@ fn prev_tail_absorbed<const SLASH: bool, const HAN: bool>(
 /// member nor space — so it resolves through the walkback (only when the
 /// scheme absorbs slashes). `None`: unresolved (callers set
 /// `force_bad_lead`).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 fn c2_os_ascii<const SLASH: bool, const HAN: bool>(bytes: &[u8], idx: usize) -> Option<u64> {
     let b2 = bytes[idx];
@@ -648,7 +648,7 @@ fn c2_os_ascii<const SLASH: bool, const HAN: bool>(bytes: &[u8], idx: usize) -> 
 /// Pure-ASCII carries. Requires `scan > 0`, `bytes[scan-1] < 0x80` (and
 /// `bytes[scan-2] < 0x80` when present), and `bytes[scan-1]` NOT a
 /// tail-class byte (those route through [`prev_tail_absorbed`] first).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 fn ascii_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: usize) -> OCarries {
     let b = bytes[scan - 1];
@@ -684,7 +684,7 @@ fn ascii_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: usize) 
 /// resolves absorbed-tail vs fresh-run via [`prev_tail_absorbed`]. An
 /// absorbed tail ended the previous token, so every "P1 is X" carry is
 /// zero and only the tail-continuation seed survives.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(never)]
 fn tail_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: usize) -> OCarries {
     match prev_tail_absorbed::<SLASH, HAN>(bytes, scan) {
@@ -729,7 +729,7 @@ fn tail_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: usize) -
 /// # Safety
 ///
 /// `scan + 70 <= bytes.len()` (the batch classifiers' lookahead guard).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 unsafe fn classify_uni_o200k<const HAN: bool>(bytes: &[u8], scan: usize, mut m: u64) -> OUni {
     use super::decode_cp_inbounds;
@@ -809,7 +809,7 @@ unsafe fn classify_uni_o200k<const HAN: bool>(bytes: &[u8], scan: usize, mut m: 
 
 /// ASCII class masks the o200k algebra needs on top of
 /// [`mask::AsciiMasks`]: strict-uppercase letters and slashes.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[derive(Clone, Copy, Default)]
 struct OAsciiExtra {
     up: u64,
@@ -820,7 +820,7 @@ struct OAsciiExtra {
 /// o200k analogue of `cl100k_family::family_extended_masks`: carries walk
 /// back through multi-byte chars with the o200k classifier, unicode chars
 /// join the effective class masks, then the shared algebra applies.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[cfg_attr(
     target_arch = "x86_64",
     target_feature(enable = "bmi1,bmi2,lzcnt,popcnt")
@@ -1009,7 +1009,7 @@ fn o200k_extended_masks<
 /// masks — `cl100k_family::family_algebra` with the o200k rules: casing
 /// boundaries inside letter runs, suffix contractions, `[\r\n/]*` punct
 /// tails. `uni` is all-zero on the pure-ASCII path.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 fn o200k_algebra<
     const CONTRACTIONS: bool,
@@ -1268,7 +1268,7 @@ fn o200k_algebra<
 /// Carries for a batch known to have only ASCII in and just before it:
 /// tail-class prev bytes route through the walkback, everything else
 /// through the branchless ASCII carries.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 fn ascii_batch_carries<const SLASH: bool, const HAN: bool>(bytes: &[u8], scan: usize) -> OCarries {
     if scan == 0 {
@@ -1439,6 +1439,80 @@ pub(crate) unsafe fn batch_masks_x86<
     }
     let cr = ascii_batch_carries::<SLASH, HAN>(bytes, scan);
     o200k_algebra::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax, cr, OUni::default())
+}
+
+/// ppc64le (POWER8 VSX) front-end, shaped exactly like `batch_masks_x86`:
+/// the classification is [`mask::ascii_masks_vsx`] plus
+/// [`ascii_extra_vsx`] (std::simd compare algebra plus the `vbpermq`
+/// movemask); the boundary algebra and the extended (non-ASCII) path are
+/// the shared scalar code. Compile-time selected — VSX/AltiVec are
+/// baseline target features on powerpc64le-unknown-linux-gnu, so there
+/// is no runtime tier detection and no unsafe contract.
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_feature = "altivec",
+    target_feature = "vsx",
+))]
+#[inline(always)]
+pub(crate) fn batch_masks_vsx<
+    const CONTRACTIONS: bool,
+    const DIGITS3: bool,
+    const SLASH: bool,
+    const HAN: bool,
+>(
+    bytes: &[u8],
+    scan: usize,
+) -> (u64, u64) {
+    let len = bytes.len();
+    if scan + 70 > len {
+        // Not enough lookahead for the batch-edge char classification.
+        return (0, u64::MAX);
+    }
+    let (am, ax) = (mask::ascii_masks_vsx(bytes, scan), ascii_extra_vsx(bytes, scan));
+    if am.hi != 0
+        || (scan >= 1 && bytes[scan - 1] >= 0x80)
+        || (scan >= 2 && bytes[scan - 2] >= 0x80)
+    {
+        return o200k_extended_masks::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax);
+    }
+    let cr = ascii_batch_carries::<SLASH, HAN>(bytes, scan);
+    o200k_algebra::<CONTRACTIONS, DIGITS3, SLASH, HAN>(bytes, scan, am, ax, cr, OUni::default())
+}
+
+/// The strict-uppercase and slash masks for `bytes[scan..scan+64]`, VSX
+/// tier — mirrors [`ascii_extra_avx512`] / [`ascii_extra_avx2`] (both
+/// masks computed unconditionally, like the x86 tiers; NEON's lazy
+/// any-tests are a per-arch choice this tier does not copy).
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_feature = "altivec",
+    target_feature = "vsx",
+))]
+#[inline(always)]
+fn ascii_extra_vsx(bytes: &[u8], scan: usize) -> OAsciiExtra {
+    use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
+    use std::simd::{Select, u8x16};
+    let zero = u8x16::splat(0);
+    let ones = u8x16::splat(0xff);
+    let mut up = [zero; 4];
+    let mut sl = [zero; 4];
+    for i in 0..4 {
+        // SAFETY: scan + 64 <= len (callers' batch guard), so all four
+        // 16-byte reads are in bounds.
+        let v = unsafe {
+            (bytes.as_ptr().add(scan + 16 * i) as *const u8x16).read_unaligned()
+        };
+        up[i] = (v - u8x16::splat(b'A'))
+            .simd_le(u8x16::splat(25))
+            .select(ones, zero);
+        sl[i] = v.simd_eq(u8x16::splat(b'/')).select(ones, zero);
+    }
+    OAsciiExtra {
+        up: mask::movemask64_vsx(up[0], up[1], up[2], up[3]),
+        sl: mask::movemask64_vsx(sl[0], sl[1], sl[2], sl[3]),
+    }
 }
 
 /// The strict-uppercase and slash masks for `bytes[scan..scan+64]`,
