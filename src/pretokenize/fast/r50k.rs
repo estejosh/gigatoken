@@ -1,7 +1,8 @@
 //! Fast pretokenizer for the GPT-2 (r50k_base) regex:
 //! `'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
 //!
-//! On aarch64 (NEON) and x86_64 with AVX-512 or AVX2 (runtime-detected)
+//! On aarch64 (NEON), x86_64 with AVX-512 or AVX2 (runtime-detected),
+//! and ppc64le (POWER8 VSX, compile-time baseline)
 //! the iterator runs a simdjson-style mask scanner: 64-byte
 //! batches are classified with SIMD into per-byte u64 class masks, the
 //! token-boundary bits are derived with shifted-mask algebra in scalar
@@ -161,10 +162,40 @@ unsafe fn batch_masks_x86<const AVX512: bool>(bytes: &[u8], scan: usize) -> (u64
     ascii_batch_algebra(bytes, scan, am.l, am.d, am.s, wsa, am.ap)
 }
 
+/// ppc64le (POWER8 VSX) counterpart of the NEON and x86 batch
+/// classifiers, shaped like `batch_masks_x86`: the classification is
+/// [`mask::ascii_masks_vsx`] (std::simd compare algebra plus the
+/// `vbpermq` movemask); the boundary algebra and the extended
+/// (non-ASCII) path are the same shared scalar code. Compile-time
+/// selected — VSX/AltiVec are baseline target features on
+/// powerpc64le-unknown-linux-gnu, so there is no runtime tier detection
+/// and no unsafe contract.
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_feature = "altivec",
+    target_feature = "vsx",
+))]
+#[inline(always)]
+fn batch_masks_vsx(bytes: &[u8], scan: usize) -> (u64, u64) {
+    let len = bytes.len();
+    if scan + 70 > len {
+        // Not enough lookahead for the batch-edge char classification
+        // (up to a 4-byte char starting at scan + 66); scalar batch.
+        return (0, u64::MAX);
+    }
+    let am = mask::ascii_masks_vsx(bytes, scan);
+    let wsa = am.s | am.wt | am.n;
+    if am.hi != 0 {
+        return extended_masks(bytes, scan, am.l, am.d, am.s, wsa, am.hi, am.ap);
+    }
+    ascii_batch_algebra(bytes, scan, am.l, am.d, am.s, wsa, am.ap)
+}
+
 /// Pure-ASCII boundary algebra shared by the NEON and AVX-512 batch
 /// classifiers (the batch has no non-ASCII byte; `wsa` = all ASCII
 /// whitespace). Everything here is platform-independent u64 bit math.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 fn ascii_batch_algebra(
     bytes: &[u8],
@@ -268,7 +299,7 @@ fn ascii_batch_algebra(
 /// set. Measured neutral on the OWT mask-compute diagnostic
 /// (ASCII-dominated); kept for codegen parity on non-ASCII-heavy corpora
 /// where this path dominates.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[cfg_attr(
     target_arch = "x86_64",
     target_feature(enable = "bmi1,bmi2,lzcnt,popcnt")
@@ -417,7 +448,7 @@ fn extended_masks(
 /// every call) is branchless — a class if-chain here is a per-batch
 /// mispredict on natural text. Callers are the batch classifiers, whose
 /// `scan + 70 <= len` guard covers the walk-back decode.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 fn carries_at(bytes: &[u8], scan: usize) -> (u64, u64, u64, u64, u64) {
     let b = bytes[scan - 1];
@@ -449,6 +480,19 @@ impl MaskScheme for R50kScheme {
         batch_masks(bytes, scan)
     }
 
+    // Overrides the trait's default-bad body; on a hypothetical LE build
+    // without VSX the default keeps every batch on the scalar path.
+    #[cfg(all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_feature = "altivec",
+        target_feature = "vsx",
+    ))]
+    #[inline(always)]
+    fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64) {
+        batch_masks_vsx(bytes, scan)
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn batch_masks_x86<const AVX512: bool>(bytes: &[u8], scan: usize) -> (u64, u64) {
@@ -457,8 +501,9 @@ impl MaskScheme for R50kScheme {
     }
 }
 
-/// With SIMD support (aarch64 NEON, or x86_64 AVX-512/AVX2 detected at
-/// runtime), iteration runs on the mask scanner above via the shared
+/// With SIMD support (aarch64 NEON, x86_64 AVX-512/AVX2 detected at
+/// runtime, or ppc64le VSX), iteration runs on the mask scanner above
+/// via the shared
 /// [`MaskState`] batch walker; elsewhere every token takes `advance_pos`.
 pub struct FastR50kPretokenizer<'a> {
     bytes: &'a [u8],
@@ -703,20 +748,20 @@ mod tests {
     /// into test loops and measure ~1.4x slow, so the interleaved perf
     /// harness needs a locally instantiated iterator. Must produce exactly
     /// the shipped tokenization.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     struct MaskIter<'a> {
         bytes: &'a [u8],
         state: MaskState,
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     impl<'a> MaskIter<'a> {
         fn new(bytes: &'a [u8]) -> Self {
             Self { bytes, state: MaskState::new(0) }
         }
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     impl<'a> Iterator for MaskIter<'a> {
         type Item = Pretoken<'a>;
         #[inline]
@@ -731,7 +776,7 @@ mod tests {
     /// on plain ASCII text it must report real token starts and no bad
     /// zones. Guards against a broken runtime detection or classifier
     /// silently passing the differential tests via the scalar fallback.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     #[test]
     fn batch_classifier_engages_on_ascii() {
         if !mask::simd_scanner_available() {
@@ -758,7 +803,7 @@ mod tests {
 
     /// Token-for-token differential check of `MaskIter` vs the shipped
     /// iterator on crafted edge cases.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     #[test]
     fn mask_iter_matches_shipped_edge_cases() {
         let cases: Vec<Vec<u8>> = vec![
@@ -804,7 +849,7 @@ mod tests {
 
     /// Differential fuzz: random mixes of letters, digits, ws, punctuation,
     /// apostrophes, and multi-byte UTF-8 at every length 0..~200.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     #[test]
     fn mask_iter_matches_shipped_fuzz() {
         let pieces: &[&str] = &[
@@ -839,7 +884,7 @@ mod tests {
     }
 
     /// Differential check on the FULL OWT file (~11.9 GB), token for token.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     #[test]
     #[ignore]
     fn mask_iter_matches_shipped_owt_full() {
@@ -868,7 +913,7 @@ mod tests {
     }
 
     /// Differential check on real OWT (100 MB), token for token.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     #[test]
     #[ignore]
     fn mask_iter_matches_shipped_owt() {
@@ -897,7 +942,7 @@ mod tests {
     /// iterator vs the mask scanner. Both variants are LOCAL copies: test
     /// builds skip fat LTO, so shipped symbols are not inlined here and
     /// measure ~1.4x slow (see project memory / step 14 of the log).
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     #[test]
     #[ignore]
     fn ab_r50k_mask_iter_interleaved() {
@@ -955,7 +1000,7 @@ mod tests {
     /// Diagnostics for the mask scanner: fallback rate on real OWT, and
     /// mask-vs-scalar throughput on a sanitized buffer (apostrophes and
     /// non-ASCII replaced) that never triggers the fallback.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     #[test]
     #[ignore]
     fn mask_iter_diagnostics() {
