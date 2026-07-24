@@ -57,7 +57,7 @@ pub(crate) fn fill_spans_keyed_mask<'a, S: mask::MaskScheme>(
     batch: &mut SpanBatch<'a>,
     prefetch: &impl Fn(u64),
 ) -> usize {
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     if mask::simd_scanner_available() {
         return state.fill_spans_two_phase::<S>(bytes, batch, prefetch);
     }

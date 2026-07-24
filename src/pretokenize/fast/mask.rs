@@ -97,6 +97,12 @@ pub(crate) fn simd_scanner_available() -> bool {
 #[inline]
 pub(crate) fn simd_scanner_available() -> bool {
     cfg!(target_arch = "aarch64")
+        || cfg!(all(
+            target_arch = "powerpc64",
+            target_endian = "little",
+            target_feature = "altivec",
+            target_feature = "vsx",
+        ))
 }
 
 // The x86-64 batch classifiers are annotated
@@ -324,6 +330,132 @@ pub(crate) fn ascii_masks_avx2(bytes: &[u8], scan: usize) -> AsciiMasks {
         let apc = _mm256_set1_epi8(b'\'' as i8);
         let ap = mm(_mm256_cmpeq_epi8(v0, apc), _mm256_cmpeq_epi8(v1, apc));
         AsciiMasks { l, d, s, wt, n, hi, ap }
+    }
+}
+
+/// POWER8 VSX movemask: 4 mask vectors (64 lanes of 0x00/0xFF) -> u64,
+/// bit i = lane i — the same contract as the NEON [`movemask64`].
+///
+/// The primitive is `vbpermq` (vector bit permute quadword) via inline
+/// asm: with the selector below it gathers each byte's MSB into a 16-bit
+/// field, i.e. a native `pmovmskb`. It MUST stay hand-rolled:
+/// `Mask::to_bitmask()` lowers catastrophically on ppc64le/pwr8 (the mask
+/// spills to GPRs and is rebuilt with a ~30-op serial `rldicl`/`rlwimi`
+/// ladder per 16 lanes) and `core::arch::powerpc64` does not expose
+/// `vbpermq` at all. Never call `Mask::to_bitmask` on ppc.
+///
+/// Verified on hardware (POWER8 S824, LE): with selector
+/// `[120,112,104,96,...,8,0]` the 16-bit mask lands in `out[1]` of the
+/// `u64x2` (the high doubleword as indexed from LE), and bit k == byte k,
+/// so `trailing_zeros()` on the combined u64 yields the first-set byte
+/// index directly.
+///
+/// Combine variant (ii), GPR combine: 4x (`vbpermq` plus `mfvsrd`) and 3
+/// shift/ORs in GPRs, instead of the vector-domain (i) form (4x
+/// `vbpermq`, a `vsldoi`/`vor` tree, one transfer). Variant (ii) has more
+/// move-port traffic (28 VSR->GPR transfers per 7-predicate batch vs 7)
+/// but simpler, endian-robust asm; POWER8's ~5 cy VSR->GPR moves are
+/// pipelined, the classifier is throughput-shaped (MaskState precomputes
+/// one batch ahead, so transfer latency is off the critical path), and
+/// with 7 independent predicates the OoO window can hide either form.
+/// A/B the two on the box before optimizing further.
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_feature = "altivec",
+    target_feature = "vsx",
+))]
+#[inline(always)]
+pub(crate) fn movemask64_vsx(
+    m0: std::simd::u8x16,
+    m1: std::simd::u8x16,
+    m2: std::simd::u8x16,
+    m3: std::simd::u8x16,
+) -> u64 {
+    use std::simd::{u8x16, u64x2};
+    // vbpermq selects bits by big-endian bit numbering (bit 0 = MSB of
+    // the quadword); index 120 - 8*k is byte k's MSB, so field bit k ==
+    // lane k (hardware-verified, see the doc comment).
+    #[inline(always)]
+    fn bperm16(x: u8x16) -> u64 {
+        const SEL: [u8; 16] = [120, 112, 104, 96, 88, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8, 0];
+        let sel = u8x16::from_array(SEL);
+        let out: u64x2;
+        // SAFETY: register-only bit permute; no memory access, no stack
+        // use. `pure, nomem` lets LLVM CSE the selector load and schedule
+        // neighboring calls together.
+        unsafe {
+            core::arch::asm!(
+                "vbpermq {o}, {a}, {s}",
+                o = out(vreg) out,
+                a = in(vreg) x,
+                s = in(vreg) sel,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        out[1]
+    }
+    bperm16(m0) | (bperm16(m1) << 16) | (bperm16(m2) << 32) | (bperm16(m3) << 48)
+}
+
+/// Classify `bytes[scan..scan+64]` with VSX (requires
+/// `scan + 64 <= bytes.len()`). The std::simd compare algebra mirrors the
+/// NEON [`ascii_masks`] predicate for predicate and lowers to clean
+/// `vcmpgtub`/`vcmpequb`/`xxlor` chains on pwr8 (LLVM fuses the `|0x20`
+/// fold + biased range compare, verified by cross-compile); only the
+/// movemask is hand-rolled asm ([`movemask64_vsx`]). Every field
+/// (including `hi` and `ap`) is computed unconditionally like the x86
+/// tiers; if profiling shows the lazy any-tests worth it, AltiVec's
+/// dot-form `vcmpequb.`/CR6 gives a transfer-free any-test later.
+#[cfg(all(
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_feature = "altivec",
+    target_feature = "vsx",
+))]
+#[inline(always)]
+pub(crate) fn ascii_masks_vsx(bytes: &[u8], scan: usize) -> AsciiMasks {
+    use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
+    use std::simd::{Select, u8x16};
+    let zero = u8x16::splat(0);
+    let ones = u8x16::splat(0xff);
+    let mut l = [zero; 4];
+    let mut d = [zero; 4];
+    let mut s = [zero; 4];
+    let mut wt = [zero; 4];
+    let mut n = [zero; 4];
+    let mut hi = [zero; 4];
+    let mut ap = [zero; 4];
+    for i in 0..4 {
+        // SAFETY: scan + 64 <= len (this fn's contract), so all four
+        // 16-byte reads are in bounds. LLVM emits lxvd2x+xxswapd on LE
+        // pwr8 for the unaligned load — same cost class as NEON's vld1q.
+        let v = unsafe {
+            (bytes.as_ptr().add(scan + 16 * i) as *const u8x16).read_unaligned()
+        };
+        let lowered = v | u8x16::splat(0x20);
+        l[i] = (lowered - u8x16::splat(b'a'))
+            .simd_le(u8x16::splat(25))
+            .select(ones, zero);
+        d[i] = (v - u8x16::splat(b'0'))
+            .simd_le(u8x16::splat(9))
+            .select(ones, zero);
+        s[i] = v.simd_eq(u8x16::splat(b' ')).select(ones, zero);
+        let nm = v.simd_eq(u8x16::splat(b'\r')) | v.simd_eq(u8x16::splat(b'\n'));
+        n[i] = nm.select(ones, zero);
+        // \t (9), \x0b (11), \x0c (12): ascii ws minus \r\n and space.
+        wt[i] = ((v - u8x16::splat(9)).simd_le(u8x16::splat(4)) & !nm).select(ones, zero);
+        hi[i] = v.simd_ge(u8x16::splat(0x80)).select(ones, zero);
+        ap[i] = v.simd_eq(u8x16::splat(b'\'')).select(ones, zero);
+    }
+    AsciiMasks {
+        l: movemask64_vsx(l[0], l[1], l[2], l[3]),
+        d: movemask64_vsx(d[0], d[1], d[2], d[3]),
+        s: movemask64_vsx(s[0], s[1], s[2], s[3]),
+        wt: movemask64_vsx(wt[0], wt[1], wt[2], wt[3]),
+        n: movemask64_vsx(n[0], n[1], n[2], n[3]),
+        hi: movemask64_vsx(hi[0], hi[1], hi[2], hi[3]),
+        ap: movemask64_vsx(ap[0], ap[1], ap[2], ap[3]),
     }
 }
 
@@ -582,6 +714,19 @@ pub(crate) trait MaskScheme {
     #[cfg(target_arch = "aarch64")]
     fn batch_masks(bytes: &[u8], scan: usize) -> (u64, u64);
 
+    /// ppc64le batch classifier; same `(usable, bad)` contract as the
+    /// aarch64 `batch_masks`. The provided default returns
+    /// `(0, u64::MAX)` — "the whole batch is a bad zone", the value the
+    /// schemes' `scan + 70 > len` guard already uses — so [`MaskState`]
+    /// routes every byte through the scheme's scalar `advance`: correct
+    /// by construction, merely slow. Schemes are ported one by one, each
+    /// VSX override an independently verifiable increment.
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+    #[inline(always)]
+    fn batch_masks(_bytes: &[u8], _scan: usize) -> (u64, u64) {
+        (0, u64::MAX)
+    }
+
     /// The x86_64 batch classifier, monomorphized on the SIMD tier
     /// (`AVX512` = true → the AVX-512 front-end, false → AVX2); same
     /// `(usable, bad)` contract as the aarch64 `batch_masks`. The fill
@@ -724,7 +869,7 @@ impl MaskState {
     /// Load the segment of `batch_usable` bits in [from_bit, next bad run)
     /// into `rem` and aim `scalar_until` past that bad run at the next
     /// trusted boundary (or the batch end).
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
     #[inline(always)]
     fn load_segment(&mut self, from_bit: u32) {
         let live = u64::MAX << from_bit;
@@ -771,7 +916,7 @@ impl MaskState {
                 self.pos = end;
                 return Some((start, end));
             }
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
             {
                 // Continue with the current batch's next trusted segment
                 // after a scalar gap (each batch is computed exactly once).
@@ -835,7 +980,7 @@ impl MaskState {
                     self.load_segment(0);
                 }
             }
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64")))]
             {
                 // Unreachable: scalar_until is usize::MAX on this arch.
                 self.scalar_until = usize::MAX;
@@ -850,7 +995,7 @@ impl MaskState {
 
 /// Set-bit positions of a byte, packed in 8 u16 lanes (unused lanes 0,
 /// never read). 4 KB, L1-resident alongside the unicode class table.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 static BIT_POS: [[u16; 8]; 256] = {
     let mut t = [[0u16; 8]; 256];
     let mut b = 1usize;
@@ -875,7 +1020,7 @@ static BIT_POS: [[u16; 8]; 256] = {
 /// popcount, so 64 bits cost the same straight-line code regardless of
 /// population. Scribbles up to `out[popcount + 7]`; callers reserve the
 /// slack. Returns the popcount.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 unsafe fn flatten_bits(m: u64, rel: u16, out: *mut u16) -> usize {
     // Per-octet popcounts (SWAR); one multiply turns them into inclusive
@@ -968,7 +1113,7 @@ unsafe fn flatten_bits_avx512(m: u64, rel: u16, out: *mut u16) -> usize {
 /// As [`flatten_bits`]; with `X86_TIER = X86_TIER_AVX512_VBMI2`,
 /// additionally [`flatten_bits_avx512`]'s contract (VBMI2 CPU, 128
 /// writable lanes).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 #[inline(always)]
 unsafe fn flatten_bits_dispatch<const X86_TIER: u8>(m: u64, rel: u16, out: *mut u16) -> usize {
     #[cfg(target_arch = "x86_64")]
@@ -990,7 +1135,7 @@ unsafe fn flatten_bits_dispatch<const X86_TIER: u8>(m: u64, rel: u16, out: *mut 
 /// is a straight instruction-count cut. The ALU form stays in
 /// `pack_mask_halves` for the latency-chained per-span paths — see its
 /// docs for the measured cost of a dependent load on those chains.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 static PACK_MASK_TABLE: [[u64; 2]; 16] = {
     let mut t = [[0u64; 2]; 16];
     let mut n = 1;
@@ -1010,16 +1155,16 @@ static PACK_MASK_TABLE: [[u64; 2]; 16] = {
 /// Worst-case cursor at a flatten call: needed - 1 (= 255) at batch entry
 /// plus up to 64 in-batch boundaries already written = 319; 319 + 128 =
 /// 447 <= 464.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 const BOUND_BUF: usize = crate::pretokenize::PRETOKEN_CHUNK + 208;
 
 /// Boundary offsets are u16-relative to the fill base; a batch is only
 /// harvested while every position it can contribute (base + 63, or the
 /// tail's `len`, both < base + 64) still fits.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 const REL_LIMIT: isize = u16::MAX as isize - 127;
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "powerpc64"))]
 impl MaskState {
     /// Two-phase `fill_spans_keyed` body: phase A harvests one chunk's
     /// boundary positions into a flat buffer (branchless [`flatten_bits`]
@@ -1482,5 +1627,100 @@ impl MaskState {
         self.scalar_until = pending;
         self.pre_base = usize::MAX;
         n
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "powerpc64",
+    target_endian = "little",
+    target_feature = "altivec",
+    target_feature = "vsx",
+))]
+mod tests {
+    use super::*;
+    use std::simd::u8x16;
+
+    /// Scalar bit-loop reference for [`movemask64_vsx`]: bit 16*g + k of
+    /// the result == "byte k of group g is nonzero" (inputs are 0x00/0xFF
+    /// mask vectors, the function's contract).
+    fn movemask64_ref(groups: &[[u8; 16]; 4]) -> u64 {
+        let mut out = 0u64;
+        for (g, bytes) in groups.iter().enumerate() {
+            for (k, &b) in bytes.iter().enumerate() {
+                if b != 0 {
+                    out |= 1u64 << (16 * g + k);
+                }
+            }
+        }
+        out
+    }
+
+    fn check(groups: &[[u8; 16]; 4]) {
+        let got = movemask64_vsx(
+            u8x16::from_array(groups[0]),
+            u8x16::from_array(groups[1]),
+            u8x16::from_array(groups[2]),
+            u8x16::from_array(groups[3]),
+        );
+        let want = movemask64_ref(groups);
+        assert_eq!(
+            got, want,
+            "movemask64_vsx endian/selector mismatch: got {got:#018x}, want {want:#018x} \
+             for {groups:?}"
+        );
+    }
+
+    /// The golden endian canary (port design §6.1): the verified
+    /// `vbpermq` selector + `out[1]` read is the entire endian surface of
+    /// the VSX tier — an endian mistake dies here, not in a token-count
+    /// diff.
+    #[test]
+    fn vsx_movemask_endian_canary() {
+        // Structured: empty, full, alternating (both phases).
+        check(&[[0u8; 16]; 4]);
+        check(&[[0xff_u8; 16]; 4]);
+        let mut alt = [[0u8; 16]; 4];
+        for g in 0..4 {
+            for k in 0..16 {
+                alt[g][k] = if (16 * g + k) % 2 == 0 { 0xff } else { 0 };
+            }
+        }
+        check(&alt);
+        for g in alt.iter_mut() {
+            for b in g.iter_mut() {
+                *b ^= 0xff;
+            }
+        }
+        check(&alt);
+        // Single-bit: exactly one 0xFF byte, at every one of the 64
+        // positions — pins bit k == byte k with no aliasing ambiguity.
+        for pos in 0..64 {
+            let mut one = [[0u8; 16]; 4];
+            one[pos / 16][pos % 16] = 0xff;
+            check(&one);
+            let got = movemask64_vsx(
+                u8x16::from_array(one[0]),
+                u8x16::from_array(one[1]),
+                u8x16::from_array(one[2]),
+                u8x16::from_array(one[3]),
+            );
+            assert_eq!(got.trailing_zeros() as usize, pos);
+        }
+        // Random 0x00/0xFF patterns (xorshift, deterministic).
+        let mut state = 0x243F_6A88_85A3_08D3_u64;
+        for _ in 0..1000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bits = state;
+            let mut groups = [[0u8; 16]; 4];
+            for g in 0..4 {
+                for k in 0..16 {
+                    groups[g][k] = if bits >> (16 * g + k) & 1 == 1 { 0xff } else { 0 };
+                }
+            }
+            check(&groups);
+        }
     }
 }
