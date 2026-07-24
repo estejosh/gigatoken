@@ -259,7 +259,8 @@ impl PairRankTable {
     /// with each other. Address math mirrors `rank` exactly (same bounds:
     /// dense idx < dense.len(), slot idx < slots.len() via `shift`), so
     /// every prefetched address lies within the table's allocations.
-    /// x86_64 only; a no-op elsewhere (aarch64 uses the NEON merge core).
+    /// x86_64 and powerpc64 only; a no-op elsewhere (aarch64 uses the NEON
+    /// merge core).
     #[inline(always)]
     pub(crate) fn prefetch_rank(&self, a: TokenId, b: TokenId) {
         #[cfg(target_arch = "x86_64")]
@@ -278,7 +279,27 @@ impl PairRankTable {
             };
             _mm_prefetch(addr, _MM_HINT_T0);
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "powerpc64")]
+        // SAFETY: `dcbt` does not dereference; both index computations are
+        // the bounded ones from `rank` (see its SAFETY comments), so the
+        // address stays inside the live allocation.
+        unsafe {
+            let addr = if (a.0 | b.0) >> self.dense_log2 == 0 {
+                let idx = ((a.0 as usize) << self.dense_log2) | b.0 as usize;
+                self.dense.as_ptr().add(idx) as *const u8
+            } else {
+                let key = ((a.0 as u64) << PAIR_ID_BITS) | b.0 as u64;
+                let idx =
+                    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+                self.slots.as_ptr().add(idx) as *const u8
+            };
+            core::arch::asm!(
+                "dcbt 0, {p}",
+                p = in(reg) addr,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "powerpc64")))]
         let _ = (a, b);
     }
 }

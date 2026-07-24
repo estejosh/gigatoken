@@ -150,7 +150,23 @@ fn prefetch_line<const L1: bool>(p: *const Entry) {
             );
         }
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(target_arch = "powerpc64")]
+    // SAFETY: `dcbt` is a touch hint with no memory effects; any address is
+    // allowed. The base form has no L1/L2 tier distinction, so both ladder
+    // rungs issue the same block touch.
+    unsafe {
+        let _ = L1;
+        core::arch::asm!(
+            "dcbt 0, {p}",
+            p = in(reg) p,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64"
+    )))]
     let _ = p;
 }
 
